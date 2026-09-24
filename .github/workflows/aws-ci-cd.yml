@@ -1,0 +1,136 @@
+name: AWS CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================================
+  # 1. TEST STAGE
+  # ============================================================================
+  test:
+    name: 1. Test & Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create temporary .env.local for test build
+        run: |
+          cat << 'EOF' > .env.local
+          NEXT_PUBLIC_CONVEX_URL=${{ secrets.NEXT_PUBLIC_CONVEX_URL || 'https://amicable-oyster-647.convex.cloud' }}
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || 'pk_test_placeholder' }}
+          CLERK_SECRET_KEY=${{ secrets.CLERK_SECRET_KEY || 'sk_test_placeholder' }}
+          EOF
+
+      - name: Run Next.js Lint
+        run: npm run lint --if-present
+
+  # ============================================================================
+  # 2. BUILD STAGE
+  # ============================================================================
+  build:
+    name: 2. Build Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create .env.local for production build
+        run: |
+          cat << 'EOF' > .env.local
+          NEXT_PUBLIC_CONVEX_URL=${{ secrets.NEXT_PUBLIC_CONVEX_URL || 'https://amicable-oyster-647.convex.cloud' }}
+          NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || 'pk_test_c3RyaWtpbmctcGhlYXNhbnQtMzguY2xlcmsuYWNjb3VudHMuZGV2JA' }}
+          CLERK_SECRET_KEY=${{ secrets.CLERK_SECRET_KEY || 'sk_test_placeholder' }}
+          NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
+          NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
+          CLERK_JWT_ISSUER_DOMAIN=${{ secrets.CLERK_JWT_ISSUER_DOMAIN || 'https://striking-pheasant-38.clerk.accounts.dev' }}
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY || 'dummy_gemini_key' }}
+          NEXT_PUBLIC_UNSPLASH_ACCESS_KEY=${{ secrets.NEXT_PUBLIC_UNSPLASH_ACCESS_KEY || 'dummy_unsplash_key' }}
+          EOF
+
+      - name: Build Docker Image with Buildx Cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ai-event-organiser:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================================
+  # 3. DEPLOY STAGE (Deploy to AWS EC2 via Docker Compose & SSH)
+  # ============================================================================
+  deploy:
+    name: 3. Deploy to AWS
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy to AWS EC2 via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.AWS_EC2_HOST }}
+          username: ${{ secrets.AWS_EC2_USER || 'ubuntu' }}
+          key: ${{ secrets.AWS_EC2_SSH_KEY }}
+          port: 22
+          script: |
+            # Exit immediately if a command exits with a non-zero status
+            set -e
+
+            APP_DIR="~/ai-event-organiser"
+
+            # Clone repository if it doesn't exist, otherwise pull latest code
+            if [ ! -d "$APP_DIR" ]; then
+              git clone https://github.com/${{ github.repository }}.git "$APP_DIR"
+              cd "$APP_DIR"
+            else
+              cd "$APP_DIR"
+              git fetch origin main
+              git reset --hard origin/main
+            fi
+
+            # Create or update production .env.local file on the server
+            cat << 'EOF' > .env.local
+            NEXT_PUBLIC_CONVEX_URL=${{ secrets.NEXT_PUBLIC_CONVEX_URL || 'https://amicable-oyster-647.convex.cloud' }}
+            NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${{ secrets.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || 'pk_test_c3RyaWtpbmctcGhlYXNhbnQtMzguY2xlcmsuYWNjb3VudHMuZGV2JA' }}
+            CLERK_SECRET_KEY=${{ secrets.CLERK_SECRET_KEY || 'sk_test_placeholder' }}
+            NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
+            NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
+            CLERK_JWT_ISSUER_DOMAIN=${{ secrets.CLERK_JWT_ISSUER_DOMAIN || 'https://striking-pheasant-38.clerk.accounts.dev' }}
+            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY || 'dummy_gemini_key' }}
+            NEXT_PUBLIC_UNSPLASH_ACCESS_KEY=${{ secrets.NEXT_PUBLIC_UNSPLASH_ACCESS_KEY || 'dummy_unsplash_key' }}
+            EOF
+
+            # Build and restart containers using Docker Compose
+            docker compose down --remove-orphans || true
+            docker compose up -d --build
+
+            # Verify container is running
+            docker ps --filter "name=server"
