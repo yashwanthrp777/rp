@@ -1,82 +1,81 @@
 # syntax=docker/dockerfile:1
 
-# Comments are provided throughout this file to help you get started.
-# If you need more help, visit the Dockerfile reference guide at
-# https://docs.docker.com/go/dockerfile-reference/
-
-# Want to help us make this template better? Share your feedback here: https://forms.gle/ybq9Krt8jtBL3iCk7
-
-ARG NODE_VERSION=24.15.0
+# Node.js LTS version for stability and compatibility with Next.js 16 on AWS Linux
+ARG NODE_VERSION=22-alpine
 
 ################################################################################
-# Use node image for base image for all stages.
-FROM node:${NODE_VERSION}-alpine AS base
+# Stage 1: Base image
+FROM node:${NODE_VERSION} AS base
 
-# Check https://github.com/nodejs/docker-node/tree/b4117f9333da4138b03a546ec926ef50a31506c3#nodealpine
-# to understand why libc6-compat might be needed.
+# Install libc6-compat for Alpine compatibility with Next.js binaries
 RUN apk add --no-cache libc6-compat
-
-# Set working directory for all build stages.
-WORKDIR /usr/src/app
-
+WORKDIR /app
 
 ################################################################################
-# Create a stage for installing production dependecies.
+# Stage 2: Install dependencies
 FROM base AS deps
+WORKDIR /app
 
-# Download dependencies as a separate step to take advantage of Docker's caching.
-# Leverage a cache mount to /root/.npm to speed up subsequent builds.
-# Leverage bind mounts to package.json and package-lock.json to avoid having to copy them
-# into this layer.
-RUN --mount=type=bind,source=package.json,target=package.json \
-    --mount=type=bind,source=package-lock.json,target=package-lock.json \
-    --mount=type=cache,target=/root/.npm \
-    npm ci --omit=dev
+# Copy dependency definition files
+COPY package.json package-lock.json ./
+
+# Install dependencies cleanly using package-lock.json
+RUN npm ci
 
 ################################################################################
-# Create a stage for building the application.
-FROM deps AS build
+# Stage 3: Build the application
+FROM base AS builder
+WORKDIR /app
 
-# Download additional development dependencies before building, as some projects require
-# "devDependencies" to be installed to build. If you don't need this, remove this step.
-RUN --mount=type=bind,source=package.json,target=package.json \
-    --mount=type=bind,source=package-lock.json,target=package-lock.json \
-    --mount=type=cache,target=/root/.npm \
-    npm ci
+# Copy installed node_modules from deps stage
+COPY --from=deps /app/node_modules ./node_modules
 
-# Copy the rest of the source files into the image.
+# Copy the rest of the application source
 COPY . .
-# Run the build script.
+
+# Disable telemetry and set production environment for build
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_ENV=production
+
+# Next.js build-time public arguments (default values allow docker build to succeed without failing on Clerk/Convex)
+ARG NEXT_PUBLIC_CONVEX_URL="https://amicable-oyster-647.convex.cloud"
+ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="pk_test_c3RyaWtpbmctcGhlYXNhbnQtMzguY2xlcmsuYWNjb3VudHMuZGV2JA"
+ARG NEXT_PUBLIC_CLERK_SIGN_IN_URL="/sign-in"
+ARG NEXT_PUBLIC_CLERK_SIGN_UP_URL="/sign-up"
+ARG NEXT_PUBLIC_UNSPLASH_ACCESS_KEY=""
+
+ENV NEXT_PUBLIC_CONVEX_URL=$NEXT_PUBLIC_CONVEX_URL
+ENV NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
+ENV NEXT_PUBLIC_CLERK_SIGN_IN_URL=$NEXT_PUBLIC_CLERK_SIGN_IN_URL
+ENV NEXT_PUBLIC_CLERK_SIGN_UP_URL=$NEXT_PUBLIC_CLERK_SIGN_UP_URL
+ENV NEXT_PUBLIC_UNSPLASH_ACCESS_KEY=$NEXT_PUBLIC_UNSPLASH_ACCESS_KEY
+
+# Build Next.js application in standalone mode
 RUN npm run build
 
 ################################################################################
-# Create a new stage to run the application with minimal runtime dependencies
-# where the necessary files are copied from the build stage.
-FROM base AS final
+# Stage 4: Production runner (minimal, lightweight, non-root)
+FROM base AS runner
+WORKDIR /app
 
-# Use production node environment by default.
 ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3000
 ENV HOSTNAME="0.0.0.0"
 
-# Run the application as a non-root user.
+# Prepare cache directory and permissions for node user
+RUN mkdir -p .next/cache && chown -R node:node /app
+
+# Copy static assets and Next.js standalone bundle
+COPY --from=builder --chown=node:node /app/public ./public
+COPY --from=builder --chown=node:node /app/.next/standalone ./
+COPY --from=builder --chown=node:node /app/.next/static ./.next/static
+
+# Run container as non-root user
 USER node
 
-# Copy package files and configuration.
-COPY --chown=node:node package.json .
-COPY --chown=node:node next.config.mjs .
-
-# Copy static public assets.
-COPY --from=build --chown=node:node /usr/src/app/public ./public
-
-# Copy the production dependencies from the deps stage and also
-# the built application (.next) from the build stage into the image.
-COPY --from=deps --chown=node:node /usr/src/app/node_modules ./node_modules
-COPY --from=build --chown=node:node /usr/src/app/.next ./.next
-
-
-# Expose the port that the application listens on.
+# Expose internal listening port
 EXPOSE 3000
 
-# Run the application.
-CMD ["npm", "start"]
+# Start standalone Next.js server
+CMD ["node", "server.js"]
